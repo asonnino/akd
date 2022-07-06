@@ -5,12 +5,11 @@
 // License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 // of this source tree.
 
-use akd::directory::Directory;
-use akd::directory::EpochHash;
+use akd::ecvrf::VRFKeyStorage;
 use akd::errors::AkdError;
-use akd::primitives::akd_vrf::AkdVRF;
 use akd::storage::types::*;
 use akd::storage::Storage;
+use akd::{Directory, EpochHash};
 use log::{debug, error, info};
 use std::marker::{Send, Sync};
 use tokio::sync::mpsc::*;
@@ -26,7 +25,7 @@ pub(crate) struct Rpc(
 #[derive(Debug)]
 pub enum DirectoryCommand {
     Publish(String, String),
-    PublishBatch(Vec<(String, String)>, bool),
+    PublishBatch(Vec<(String, String)>),
     Lookup(String),
     KeyHistory(String),
     Audit(u64, u64),
@@ -41,7 +40,7 @@ async fn get_root_hash<S, H, V>(
 where
     S: Storage + Sync + Send,
     H: Hasher,
-    V: AkdVRF,
+    V: VRFKeyStorage,
 {
     if let Ok(azks) = directory.retrieve_current_azks().await {
         match o_epoch {
@@ -57,7 +56,7 @@ pub(crate) async fn init_host<S, H, V>(rx: &mut Receiver<Rpc>, directory: &mut D
 where
     S: Storage + Sync + Send,
     H: Hasher,
-    V: AkdVRF,
+    V: VRFKeyStorage,
 {
     info!("Starting the verifiable directory host");
 
@@ -69,7 +68,10 @@ where
             (DirectoryCommand::Publish(a, b), Some(response)) => {
                 let tic = Instant::now();
                 match directory
-                    .publish::<H>(vec![(AkdLabel(a.clone()), AkdValue(b.clone()))], false)
+                    .publish::<H>(vec![(
+                        AkdLabel::from_utf8_str(&a),
+                        AkdValue::from_utf8_str(&b),
+                    )])
                     .await
                 {
                     Ok(EpochHash(epoch, hash)) => {
@@ -90,16 +92,20 @@ where
                     }
                 }
             }
-            (DirectoryCommand::PublishBatch(batches, with_trans), Some(response)) => {
+            (DirectoryCommand::PublishBatch(batches), Some(response)) => {
                 let tic = Instant::now();
                 let len = batches.len();
                 match directory
                     .publish::<H>(
                         batches
                             .into_iter()
-                            .map(|(key, value)| (AkdLabel(key), AkdValue(value)))
+                            .map(|(key, value)| {
+                                (
+                                    AkdLabel::from_utf8_str(&key),
+                                    AkdValue::from_utf8_str(&value),
+                                )
+                            })
                             .collect(),
-                        with_trans,
                     )
                     .await
                 {
@@ -115,16 +121,16 @@ where
                 }
             }
             (DirectoryCommand::Lookup(a), Some(response)) => {
-                match directory.lookup::<H>(AkdLabel(a.clone())).await {
+                match directory.lookup::<H>(AkdLabel::from_utf8_str(&a)).await {
                     Ok(proof) => {
                         let hash = get_root_hash::<_, H, V>(directory, None).await;
                         match hash {
                             Some(Ok(root_hash)) => {
-                                let vrf_pk = directory.get_public_key().unwrap();
-                                let verification = akd::client::lookup_verify::<H, V>(
-                                    vrf_pk,
+                                let vrf_pk = directory.get_public_key().await.unwrap();
+                                let verification = akd::client::lookup_verify::<H>(
+                                    &vrf_pk,
                                     root_hash,
-                                    AkdLabel(a.clone()),
+                                    AkdLabel::from_utf8_str(&a),
                                     proof,
                                 );
                                 if verification.is_err() {
@@ -151,7 +157,10 @@ where
                 }
             }
             (DirectoryCommand::KeyHistory(a), Some(response)) => {
-                match directory.key_history::<H>(&AkdLabel(a.clone())).await {
+                match directory
+                    .key_history::<H>(&AkdLabel::from_utf8_str(&a))
+                    .await
+                {
                     Ok(_proof) => {
                         let msg = format!("GOT KEY HISTORY FOR '{}'", a);
                         response.send(Ok(msg)).unwrap();

@@ -5,8 +5,9 @@
 // License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 // of this source tree.
 
-//! This module is meant to provide traits for various cryptographic primitives.
+use akd_test_tools::fixture_generator;
 
-extern crate vrf;
-pub mod akd_vrf;
-pub mod client_vrf;
+#[tokio::main]
+async fn main() {
+    fixture_generator::run().await;
+}

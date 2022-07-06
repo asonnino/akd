@@ -12,11 +12,10 @@
 //!
 //! Append-only and history proofs to come
 
-use std::convert::TryInto;
-
 use crate::ARITY;
 #[cfg(feature = "nostd")]
 use alloc::vec::Vec;
+use core::convert::TryInto;
 
 // ============================================
 // Typedefs and constants
@@ -32,6 +31,22 @@ pub type AkdValue = Vec<u8>;
 /// A hash digest (size will depend on hashing algorithm specified
 /// at compilation time)
 pub type Digest = [u8; crate::hash::DIGEST_BYTES];
+
+/// The value to be hashed every time an empty node's hash is to be considered
+pub const EMPTY_VALUE: [u8; 1] = [0u8];
+
+/// The label used for an empty node
+pub const EMPTY_LABEL: NodeLabel = NodeLabel {
+    val: [1u8; 32],
+    len: 0,
+};
+
+/// A "tombstone" is a false value in an AKD ValueState denoting that a real value has been removed (e.g. data rentention policies).
+/// Should a tombstone be encountered, we have to assume that the hash of the value is correct, and we move forward without being able to
+/// verify the raw value. We utilize an empty array to save space in the storage layer
+///
+/// See [GitHub issue #130](https://github.com/novifinancial/akd/issues/130) for more context
+pub const TOMBSTONE: &[u8] = &[];
 
 // ============================================
 // Structs
@@ -49,9 +64,8 @@ pub struct NodeLabel {
 
 impl NodeLabel {
     pub(crate) fn hash(&self) -> Digest {
-        let byte_label_len = crate::hash::hash(&self.len.to_be_bytes());
-        let byte_label_val = crate::hash::hash(&self.val);
-        crate::hash::merge(&[byte_label_len, byte_label_val])
+        let hash_input = [&self.len.to_be_bytes()[..], &self.val].concat();
+        crate::hash::hash(&hash_input)
     }
 
     /// Takes as input a pointer to the caller and another NodeLabel,
@@ -69,7 +83,9 @@ impl NodeLabel {
         {
             prefix_len += 1;
         }
-
+        if *self == EMPTY_LABEL || other == EMPTY_LABEL {
+            return EMPTY_LABEL;
+        }
         self.get_prefix(prefix_len)
     }
 
@@ -176,7 +192,7 @@ pub struct LookupProof {
     /// The version of the record
     pub version: u64,
     /// VRF proof for the label corresponding to this version
-    pub exisitence_vrf_proof: Vec<u8>,
+    pub existence_vrf_proof: Vec<u8>,
     /// Record existence proof
     pub existence_proof: MembershipProof,
     /// VRF proof for the marker preceding (less than or equal to) this version
@@ -187,4 +203,52 @@ pub struct LookupProof {
     pub freshness_vrf_proof: Vec<u8>,
     /// Freshness proof (non member at previous epoch)
     pub freshness_proof: NonMembershipProof,
+    /// Proof for commitment value derived from raw AkdLabel and AkdValue
+    pub commitment_proof: Vec<u8>,
+}
+
+/// A vector of UpdateProofs are sent as the proof to a history query for a particular key.
+/// For each version of the value associated with the key, the verifier must check that:
+/// * the version was included in the claimed epoch,
+/// * the previous version was retired at this epoch,
+/// * the version did not exist prior to this epoch,
+/// * the next few versions (up until the next marker), did not exist at this epoch,
+/// * the future marker versions did  not exist at this epoch.
+#[cfg_attr(feature = "wasm", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateProof {
+    /// Epoch of this update
+    pub epoch: u64,
+    /// Value at this update
+    pub plaintext_value: AkdValue,
+    /// Version at this update
+    pub version: u64,
+    /// VRF proof for the label for the current version
+    pub existence_vrf_proof: Vec<u8>,
+    /// Membership proof to show that the key was included in this epoch
+    pub existence_at_ep: MembershipProof,
+    /// VRF proof for the label for the previous version which became stale
+    pub previous_val_vrf_proof: Option<Vec<u8>>,
+    /// Proof that previous value was set to old at this epoch
+    pub previous_val_stale_at_ep: Option<MembershipProof>,
+    /// Proof for commitment value derived from raw AkdLabel and AkdValue
+    pub commitment_proof: Vec<u8>,
+}
+
+/// This proof is just an array of [`UpdateProof`]s.
+#[cfg_attr(feature = "wasm", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryProof {
+    /// The update proofs in the key history
+    pub update_proofs: Vec<UpdateProof>,
+    /// The epochs at which updates were made.
+    pub epochs: Vec<u64>,
+    /// VRF Proofs for the labels of the next few values
+    pub next_few_vrf_proofs: Vec<Vec<u8>>,
+    /// Proof that the next few values did not exist at this time
+    pub non_existence_of_next_few: Vec<NonMembershipProof>,
+    /// VRF proofs for the labels of future marker entries
+    pub future_marker_vrf_proofs: Vec<Vec<u8>>,
+    /// Proof that future markers did not exist
+    pub non_existence_of_future_markers: Vec<NonMembershipProof>,
 }

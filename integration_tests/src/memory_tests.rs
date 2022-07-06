@@ -5,7 +5,7 @@
 // License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 // of this source tree.
 
-use akd::primitives::akd_vrf::HardCodedAkdVRF;
+use akd::ecvrf::HardCodedAkdVRF;
 use log::info;
 
 type InMemoryDb = akd::storage::memory::AsyncInMemoryDatabase;
@@ -20,7 +20,7 @@ async fn test_directory_operations() {
     let db = InMemoryDb::new();
 
     let vrf = HardCodedAkdVRF {};
-    crate::test_util::directory_test_suite::<_, HardCodedAkdVRF>(&db, 500, &vrf).await;
+    akd_test_tools::test_suites::directory_test_suite::<_, HardCodedAkdVRF>(&db, 500, &vrf).await;
 
     info!("\n\n******** Finished In-Memory Directory Operations Integration Test ********\n\n");
 }

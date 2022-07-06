@@ -4,17 +4,26 @@
 // LICENSE-MIT file in the root directory of this source tree and the Apache
 // License, Version 2.0 found in the LICENSE-APACHE file in the root directory
 // of this source tree.
-//! This module contains various memory representations.
+
+//! This module contains an in-memory database for the AKD library as well as
+//! an in-memory implementation which contains some caching implementations for
+//! benchmarking
+
 use crate::errors::StorageError;
 use crate::storage::transaction::Transaction;
 use crate::storage::types::{
-    AkdLabel, DbRecord, KeyData, StorageType, ValueState, ValueStateKey, ValueStateRetrievalFlag,
+    AkdLabel, AkdValue, DbRecord, KeyData, StorageType, ValueState, ValueStateKey,
+    ValueStateRetrievalFlag,
 };
-use crate::storage::{Storable, Storage};
+use crate::storage::{Storable, Storage, StorageUtil};
 use async_trait::async_trait;
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+type Epoch = u64;
+type UserValueMap = HashMap<Epoch, ValueState>;
+type UserStates = HashMap<Vec<u8>, UserValueMap>;
 
 // ===== Basic In-Memory database ==== //
 
@@ -22,7 +31,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct AsyncInMemoryDatabase {
     db: Arc<tokio::sync::RwLock<HashMap<Vec<u8>, DbRecord>>>,
-    user_info: Arc<tokio::sync::RwLock<HashMap<String, Vec<ValueState>>>>,
+    user_info: Arc<tokio::sync::RwLock<UserStates>>,
     trans: Transaction,
 }
 
@@ -96,12 +105,20 @@ impl Storage for AsyncInMemoryDatabase {
         }
 
         if let DbRecord::ValueState(value_state) = &record {
-            let mut guard = self.user_info.write().await;
-            let username = value_state.username.0.clone();
-            guard
-                .entry(username)
-                .or_insert_with(Vec::new)
-                .push(value_state.clone());
+            let mut u_guard = self.user_info.write().await;
+            let username = value_state.username.to_vec();
+            match u_guard.get(&username) {
+                Some(old_states) => {
+                    let mut new_states = old_states.clone();
+                    new_states.insert(value_state.epoch, value_state.clone());
+                    u_guard.insert(username, new_states);
+                }
+                None => {
+                    let mut new_map = HashMap::new();
+                    new_map.insert(value_state.epoch, value_state.clone());
+                    u_guard.insert(username, new_map);
+                }
+            }
         } else {
             let mut guard = self.db.write().await;
             guard.insert(record.get_full_binary_id(), record);
@@ -116,11 +133,19 @@ impl Storage for AsyncInMemoryDatabase {
 
         for record in records.into_iter() {
             if let DbRecord::ValueState(value_state) = &record {
-                let username = value_state.username.0.clone();
-                u_guard
-                    .entry(username)
-                    .or_insert_with(Vec::new)
-                    .push(value_state.clone());
+                let username = value_state.username.to_vec();
+                match u_guard.get(&username) {
+                    Some(old_states) => {
+                        let mut new_states = old_states.clone();
+                        new_states.insert(value_state.epoch, value_state.clone());
+                        u_guard.insert(username, new_states);
+                    }
+                    None => {
+                        let mut new_map = HashMap::new();
+                        new_map.insert(value_state.epoch, value_state.clone());
+                        u_guard.insert(username, new_map);
+                    }
+                }
             } else {
                 guard.insert(record.get_full_binary_id(), record);
             }
@@ -129,9 +154,9 @@ impl Storage for AsyncInMemoryDatabase {
     }
 
     /// Retrieve a stored record from the data layer
-    async fn get<St: Storable>(&self, id: St::Key) -> Result<DbRecord, StorageError> {
+    async fn get<St: Storable>(&self, id: &St::Key) -> Result<DbRecord, StorageError> {
         if self.is_transaction_active().await {
-            if let Some(result) = self.trans.get::<St>(&id).await {
+            if let Some(result) = self.trans.get::<St>(id).await {
                 // there's a transacted item, return that one since it's "more up to date"
                 return Ok(result);
             }
@@ -140,18 +165,18 @@ impl Storage for AsyncInMemoryDatabase {
     }
 
     /// Retrieve a record from the data layer, ignoring any caching or transaction pending
-    async fn get_direct<St: Storable>(&self, id: St::Key) -> Result<DbRecord, StorageError> {
-        let bin_id = St::get_full_binary_key_id(&id);
+    async fn get_direct<St: Storable>(&self, id: &St::Key) -> Result<DbRecord, StorageError> {
+        let bin_id = St::get_full_binary_key_id(id);
         // if the request is for a value state, look in the value state set
         if St::data_type() == StorageType::ValueState {
             if let Ok(ValueStateKey(username, epoch)) = ValueState::key_from_full_binary(&bin_id) {
                 let u_guard = self.user_info.read().await;
                 if let Some(state) = (*u_guard).get(&username).cloned() {
-                    if let Some(item) = state.iter().find(|&x| x.epoch == epoch) {
-                        return Ok(DbRecord::ValueState(item.clone()));
+                    if let Some(found) = state.get(&epoch) {
+                        return Ok(DbRecord::ValueState(found.clone()));
                     }
                 }
-                return Err(StorageError::GetData("Not found".to_string()));
+                return Err(StorageError::NotFound(format!("ValueState {:?}", id)));
             }
         }
         // fallback to regular get/set db
@@ -159,7 +184,11 @@ impl Storage for AsyncInMemoryDatabase {
         if let Some(result) = (*guard).get(&bin_id).cloned() {
             Ok(result)
         } else {
-            Err(StorageError::GetData("Not found".to_string()))
+            Err(StorageError::NotFound(format!(
+                "{:?} {:?}",
+                St::data_type(),
+                id
+            )))
         }
     }
 
@@ -171,10 +200,10 @@ impl Storage for AsyncInMemoryDatabase {
     /// Retrieve a batch of records by id
     async fn batch_get<St: Storable>(
         &self,
-        ids: Vec<St::Key>,
+        ids: &[St::Key],
     ) -> Result<Vec<DbRecord>, StorageError> {
         let mut map = Vec::new();
-        for key in ids.into_iter() {
+        for key in ids.iter() {
             if let Ok(result) = self.get::<St>(key).await {
                 map.push(result);
             }
@@ -183,17 +212,46 @@ impl Storage for AsyncInMemoryDatabase {
         Ok(map)
     }
 
+    async fn tombstone_value_states(&self, keys: &[ValueStateKey]) -> Result<(), StorageError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let data = self.batch_get::<ValueState>(keys).await?;
+        let mut new_data = vec![];
+        for record in data {
+            if let DbRecord::ValueState(value_state) = record {
+                debug!(
+                    "Tombstoning 0x{}",
+                    hex::encode(value_state.username.to_vec())
+                );
+
+                new_data.push(DbRecord::ValueState(ValueState {
+                    plaintext_val: crate::AkdValue(crate::TOMBSTONE.to_vec()),
+                    ..value_state
+                }));
+            }
+        }
+
+        if !new_data.is_empty() {
+            debug!("Tombstoning {} entries", new_data.len());
+            self.batch_set(new_data).await?;
+        }
+
+        Ok(())
+    }
+
     /// Retrieve the user data for a given user
     async fn get_user_data(&self, username: &AkdLabel) -> Result<KeyData, StorageError> {
         let guard = self.user_info.read().await;
         if let Some(result) = guard.get(&username.0) {
-            let mut results: Vec<ValueState> = result.to_vec();
+            let mut results: Vec<ValueState> = result.values().cloned().collect::<Vec<_>>();
             // return ordered by epoch (from smallest -> largest)
             results.sort_by(|a, b| a.epoch.cmp(&b.epoch));
 
             Ok(KeyData { states: results })
         } else {
-            Err(StorageError::GetData("Not found".to_string()))
+            Err(StorageError::NotFound(format!("ValueState {:?}", username)))
         }
     }
 
@@ -260,59 +318,58 @@ impl Storage for AsyncInMemoryDatabase {
                 }
             }
         }
-        Err(StorageError::GetData(String::from("Not found")))
+        Err(StorageError::NotFound(format!("ValueState {:?}", username)))
     }
 
     async fn get_user_state_versions(
         &self,
         keys: &[AkdLabel],
         flag: ValueStateRetrievalFlag,
-    ) -> Result<HashMap<AkdLabel, u64>, StorageError> {
+    ) -> Result<HashMap<AkdLabel, (u64, AkdValue)>, StorageError> {
         let mut map = HashMap::new();
         for username in keys.iter() {
             if let Ok(result) = self.get_user_state(username, flag).await {
-                map.insert(AkdLabel(result.username.0.clone()), result.version);
+                map.insert(
+                    AkdLabel(result.username.to_vec()),
+                    (result.version, AkdValue(result.plaintext_val.to_vec())),
+                );
             }
         }
         Ok(map)
     }
+}
 
-    async fn get_epoch_lte_epoch(
-        &self,
-        node_label: crate::node_state::NodeLabel,
-        epoch_in_question: u64,
-    ) -> Result<u64, StorageError> {
-        let ids = (0..=epoch_in_question)
-            .map(|epoch| crate::node_state::NodeStateKey(node_label, epoch))
-            .collect::<Vec<_>>();
-        let data = self
-            .batch_get::<crate::node_state::HistoryNodeState>(ids)
-            .await?;
-        let mut epochs = data
+#[async_trait]
+impl StorageUtil for AsyncInMemoryDatabase {
+    async fn batch_get_type_direct<St: Storable>(&self) -> Result<Vec<DbRecord>, StorageError> {
+        let records = self
+            .batch_get_all_direct()
+            .await?
             .into_iter()
-            .map(|item| {
-                if let DbRecord::HistoryNodeState(state) = item {
-                    state.key.1
-                } else {
-                    0u64
-                }
+            .filter(|record| match record {
+                DbRecord::Azks(_) => St::data_type() == StorageType::Azks,
+                DbRecord::TreeNode(_) => St::data_type() == StorageType::TreeNode,
+                DbRecord::ValueState(_) => St::data_type() == StorageType::ValueState,
             })
-            .collect::<Vec<u64>>();
-        // reverse sort
-        epochs.sort_unstable_by(|a, b| b.cmp(a));
+            .collect();
 
-        // move through the epochs from largest to smallest, first one that's <= ```epoch_in_question```
-        // and Bob's your uncle
-        for item in epochs {
-            if item <= epoch_in_question {
-                return Ok(item);
-            }
-        }
+        Ok(records)
+    }
 
-        Err(StorageError::GetData(format!(
-            "Node (val: {:?}, len: {}) did not exist <= epoch {}",
-            node_label.val, node_label.len, epoch_in_question
-        )))
+    async fn batch_get_all_direct(&self) -> Result<Vec<DbRecord>, StorageError> {
+        // get value states
+        let u_guard = self.user_info.read().await;
+        let u_records = u_guard
+            .values()
+            .cloned()
+            .flat_map(|v| v.into_values())
+            .map(DbRecord::ValueState);
+
+        // get other records and collect
+        let guard = self.db.read().await;
+        let records = guard.values().cloned().chain(u_records).collect();
+
+        Ok(records)
     }
 }
 
@@ -320,24 +377,28 @@ impl Storage for AsyncInMemoryDatabase {
 
 /// Represents an in-memory database with caching and metric calculation for benchmarking
 #[derive(Debug)]
+#[cfg(feature = "public-tests")]
 pub struct AsyncInMemoryDbWithCache {
     db: Arc<tokio::sync::RwLock<HashMap<Vec<u8>, DbRecord>>>,
     cache: Arc<tokio::sync::RwLock<HashMap<Vec<u8>, DbRecord>>>,
     stats: Arc<tokio::sync::RwLock<HashMap<String, usize>>>,
 
-    user_info: Arc<tokio::sync::RwLock<HashMap<String, Vec<ValueState>>>>,
+    user_info: Arc<tokio::sync::RwLock<UserStates>>,
     trans: Transaction,
 }
 
+#[cfg(feature = "public-tests")]
 unsafe impl Send for AsyncInMemoryDbWithCache {}
+#[cfg(feature = "public-tests")]
 unsafe impl Sync for AsyncInMemoryDbWithCache {}
 
+#[cfg(feature = "public-tests")]
 impl Default for AsyncInMemoryDbWithCache {
     fn default() -> Self {
         Self::new()
     }
 }
-
+#[cfg(feature = "public-tests")]
 impl Clone for AsyncInMemoryDbWithCache {
     fn clone(&self) -> Self {
         Self {
@@ -350,7 +411,7 @@ impl Clone for AsyncInMemoryDbWithCache {
         }
     }
 }
-
+#[cfg(feature = "public-tests")]
 impl AsyncInMemoryDbWithCache {
     /// Creates a new in memory db with caching
     pub fn new() -> Self {
@@ -421,7 +482,7 @@ impl AsyncInMemoryDbWithCache {
         println!("---------------------");
     }
 }
-
+#[cfg(feature = "public-tests")]
 #[async_trait]
 impl Storage for AsyncInMemoryDbWithCache {
     async fn log_metrics(&self, level: log::Level) {
@@ -467,12 +528,20 @@ impl Storage for AsyncInMemoryDbWithCache {
         }
 
         if let DbRecord::ValueState(value_state) = &record {
-            let mut guard = self.user_info.write().await;
-            let username = value_state.username.0.clone();
-            guard
-                .entry(username)
-                .or_insert_with(Vec::new)
-                .push(value_state.clone());
+            let mut u_guard = self.user_info.write().await;
+            let username = value_state.username.to_vec();
+            match u_guard.get(&username) {
+                Some(old_states) => {
+                    let mut new_states = old_states.clone();
+                    new_states.insert(value_state.epoch, value_state.clone());
+                    u_guard.insert(username, new_states);
+                }
+                None => {
+                    let mut new_map = HashMap::new();
+                    new_map.insert(value_state.epoch, value_state.clone());
+                    u_guard.insert(username, new_map);
+                }
+            }
         } else {
             let mut stats = self.stats.write().await;
             let calls = stats.entry(String::from("calls_to_cache_set")).or_insert(0);
@@ -493,11 +562,19 @@ impl Storage for AsyncInMemoryDbWithCache {
 
         for record in records.into_iter() {
             if let DbRecord::ValueState(value_state) = &record {
-                let username = value_state.username.0.clone();
-                u_guard
-                    .entry(username)
-                    .or_insert_with(Vec::new)
-                    .push(value_state.clone());
+                let username = value_state.username.to_vec();
+                match u_guard.get(&username) {
+                    Some(old_states) => {
+                        let mut new_states = old_states.clone();
+                        new_states.insert(value_state.epoch, value_state.clone());
+                        u_guard.insert(username, new_states);
+                    }
+                    None => {
+                        let mut new_map = HashMap::new();
+                        new_map.insert(value_state.epoch, value_state.clone());
+                        u_guard.insert(username, new_map);
+                    }
+                }
             } else {
                 *calls += 1;
                 guard.insert(record.get_full_binary_id(), record);
@@ -506,9 +583,9 @@ impl Storage for AsyncInMemoryDbWithCache {
         Ok(())
     }
 
-    async fn get<St: Storable>(&self, id: St::Key) -> Result<DbRecord, StorageError> {
+    async fn get<St: Storable>(&self, id: &St::Key) -> Result<DbRecord, StorageError> {
         if self.is_transaction_active().await {
-            if let Some(result) = self.trans.get::<St>(&id).await {
+            if let Some(result) = self.trans.get::<St>(id).await {
                 // there's a transacted item, return that one since it's "more up to date"
                 return Ok(result);
             }
@@ -517,18 +594,18 @@ impl Storage for AsyncInMemoryDbWithCache {
     }
 
     /// Retrieve a record from the data layer, ignoring any caching or transaction pending
-    async fn get_direct<St: Storable>(&self, id: St::Key) -> Result<DbRecord, StorageError> {
-        let bin_id = St::get_full_binary_key_id(&id);
+    async fn get_direct<St: Storable>(&self, id: &St::Key) -> Result<DbRecord, StorageError> {
+        let bin_id = St::get_full_binary_key_id(id);
         // if the request is for a value state, look in the value state set
         if St::data_type() == StorageType::ValueState {
             if let Ok(ValueStateKey(username, epoch)) = ValueState::key_from_full_binary(&bin_id) {
                 let u_guard = self.user_info.read().await;
                 if let Some(state) = (*u_guard).get(&username).cloned() {
-                    if let Some(item) = state.iter().find(|&x| x.epoch == epoch) {
-                        return Ok(DbRecord::ValueState(item.clone()));
+                    if let Some(found) = state.get(&epoch) {
+                        return Ok(DbRecord::ValueState(found.clone()));
                     }
                 }
-                return Err(StorageError::GetData("Not found".to_string()));
+                return Err(StorageError::NotFound(format!("ValueState {:?}", id)));
             }
         }
         let mut stats = self.stats.write().await;
@@ -547,23 +624,26 @@ impl Storage for AsyncInMemoryDbWithCache {
 
                     Ok(result)
                 } else {
-                    Err(StorageError::GetData("Not found".to_string()))
+                    Err(StorageError::NotFound(format!(
+                        "{:?} {:?}",
+                        St::data_type(),
+                        id
+                    )))
                 }
             }
         }
     }
 
-    /// Flush the caching of objects (if present)
     async fn flush_cache(&self) {
         // no-op
     }
 
     async fn batch_get<St: Storable>(
         &self,
-        ids: Vec<St::Key>,
+        ids: &[St::Key],
     ) -> Result<Vec<DbRecord>, StorageError> {
         let mut map = Vec::new();
-        for key in ids.into_iter() {
+        for key in ids.iter() {
             if let Ok(result) = self.get::<St>(key).await {
                 map.push(result);
             }
@@ -572,16 +652,39 @@ impl Storage for AsyncInMemoryDbWithCache {
         Ok(map)
     }
 
+    async fn tombstone_value_states(&self, keys: &[ValueStateKey]) -> Result<(), StorageError> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+
+        let data = self.batch_get::<ValueState>(keys).await?;
+        let mut new_data = vec![];
+        for record in data {
+            if let DbRecord::ValueState(value_state) = record {
+                new_data.push(DbRecord::ValueState(ValueState {
+                    plaintext_val: crate::AkdValue(crate::TOMBSTONE.to_vec()),
+                    ..value_state
+                }));
+            }
+        }
+
+        if !new_data.is_empty() {
+            self.batch_set(new_data).await?;
+        }
+
+        Ok(())
+    }
+
     async fn get_user_data(&self, username: &AkdLabel) -> Result<KeyData, StorageError> {
         let guard = self.user_info.read().await;
         if let Some(result) = guard.get(&username.0) {
-            let mut results: Vec<ValueState> = result.to_vec();
+            let mut results: Vec<ValueState> = result.values().cloned().collect();
             // return ordered by epoch (from smallest -> largest)
             results.sort_by(|a, b| a.epoch.cmp(&b.epoch));
 
             Ok(KeyData { states: results })
         } else {
-            Err(StorageError::GetData("Not found".to_string()))
+            Err(StorageError::NotFound(format!("ValueState {:?}", username)))
         }
     }
 
@@ -647,57 +750,58 @@ impl Storage for AsyncInMemoryDbWithCache {
                 }
             }
         }
-        Err(StorageError::GetData(String::from("Not found")))
+        Err(StorageError::NotFound(format!("ValueState {:?}", username)))
     }
 
     async fn get_user_state_versions(
         &self,
         keys: &[AkdLabel],
         flag: ValueStateRetrievalFlag,
-    ) -> Result<HashMap<AkdLabel, u64>, StorageError> {
+    ) -> Result<HashMap<AkdLabel, (u64, AkdValue)>, StorageError> {
         let mut map = HashMap::new();
         for username in keys.iter() {
             if let Ok(result) = self.get_user_state(username, flag).await {
-                map.insert(AkdLabel(result.username.0.clone()), result.version);
+                map.insert(
+                    AkdLabel(result.username.to_vec()),
+                    (result.version, AkdValue(result.plaintext_val.to_vec())),
+                );
             }
         }
         Ok(map)
     }
+}
 
-    async fn get_epoch_lte_epoch(
-        &self,
-        node_label: crate::node_state::NodeLabel,
-        epoch_in_question: u64,
-    ) -> Result<u64, StorageError> {
-        let ids = (0..=epoch_in_question)
-            .map(|epoch| crate::node_state::NodeStateKey(node_label, epoch))
-            .collect::<Vec<_>>();
-        let data = self
-            .batch_get::<crate::node_state::HistoryNodeState>(ids)
-            .await?;
-        let mut epochs = data
+#[cfg(feature = "public-tests")]
+#[async_trait]
+impl StorageUtil for AsyncInMemoryDbWithCache {
+    async fn batch_get_type_direct<St: Storable>(&self) -> Result<Vec<DbRecord>, StorageError> {
+        let records = self
+            .batch_get_all_direct()
+            .await?
             .into_iter()
-            .map(|item| {
-                if let DbRecord::HistoryNodeState(state) = item {
-                    state.key.1
-                } else {
-                    0u64
-                }
+            .filter(|record| match record {
+                DbRecord::Azks(_) => St::data_type() == StorageType::Azks,
+                DbRecord::TreeNode(_) => St::data_type() == StorageType::TreeNode,
+                DbRecord::ValueState(_) => St::data_type() == StorageType::ValueState,
             })
-            .collect::<Vec<u64>>();
-        // reverse sort
-        epochs.sort_unstable_by(|a, b| b.cmp(a));
+            .collect();
 
-        // move through the epochs from largest to smallest, first one that's <= ```epoch_in_question```
-        // and Bob's your uncle
-        for item in epochs {
-            if item <= epoch_in_question {
-                return Ok(item);
-            }
-        }
-        Err(StorageError::GetData(format!(
-            "Node (val: {:?}, len: {}) did not exist <= epoch {}",
-            node_label.val, node_label.len, epoch_in_question
-        )))
+        Ok(records)
+    }
+
+    async fn batch_get_all_direct(&self) -> Result<Vec<DbRecord>, StorageError> {
+        // get value states
+        let u_guard = self.user_info.read().await;
+        let u_records = u_guard
+            .values()
+            .cloned()
+            .flat_map(|v| v.into_values())
+            .map(DbRecord::ValueState);
+
+        // get other records and collect
+        let guard = self.db.read().await;
+        let records = guard.values().cloned().chain(u_records).collect();
+
+        Ok(records)
     }
 }

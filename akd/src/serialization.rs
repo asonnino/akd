@@ -7,25 +7,28 @@
 
 //! This module contains serialization calls for helping serialize/deserialize digests
 
-use crate::errors::HistoryTreeNodeError;
+use crate::errors::{AkdError, TreeNodeError};
+
+#[cfg(feature = "serde_serialization")]
+use hex::{FromHex, ToHex};
+#[cfg(feature = "serde_serialization")]
 use serde::{Deserialize, Serialize};
 use winter_crypto::{Digest, Hasher};
-use winter_utils::{Deserializable, Serializable, SliceReader};
+use winter_utils::{Deserializable, SliceReader};
 
 /// Converts from &[u8] to H::Digest
-pub fn to_digest<H: Hasher>(input: &[u8]) -> Result<H::Digest, HistoryTreeNodeError> {
-    H::Digest::read_from(&mut SliceReader::new(input))
-        .map_err(|_| HistoryTreeNodeError::SerializationError)
+pub fn to_digest<H: Hasher>(input: &[u8]) -> Result<H::Digest, AkdError> {
+    Ok(H::Digest::read_from(&mut SliceReader::new(input))
+        .map_err(|msg| TreeNodeError::DigestDeserializationFailed(format!("{}", msg)))?)
 }
 
-/// Converts from H::Digest to Vec<u8>
-pub fn from_digest<H: Hasher>(input: H::Digest) -> Result<Vec<u8>, HistoryTreeNodeError> {
-    let mut output = vec![];
-    input.write_into(&mut output);
-    Ok(output)
+/// Converts from H::Digest to [u8; 32]
+pub fn from_digest<H: Hasher>(input: H::Digest) -> [u8; 32] {
+    input.as_bytes()
 }
 
 /// A serde serializer for the type `winter_crypto::Digest`
+#[cfg(feature = "serde_serialization")]
 pub fn digest_serialize<S, T>(x: &T, s: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -35,6 +38,7 @@ where
 }
 
 /// A serde deserializer for the type `winter_crypto::Digest`
+#[cfg(feature = "serde_serialization")]
 pub fn digest_deserialize<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -44,13 +48,36 @@ where
     T::read_from(&mut SliceReader::new(&buf)).map_err(serde::de::Error::custom)
 }
 
+/// A serde hex serializer for bytes
+#[cfg(feature = "serde_serialization")]
+pub fn bytes_serialize_hex<S, T>(x: &T, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    T: AsRef<[u8]>,
+{
+    let hex_str = &x.as_ref().encode_hex_upper::<String>();
+    s.serialize_str(hex_str)
+}
+
+/// A serde hex deserializer for bytes
+#[cfg(feature = "serde_serialization")]
+pub fn bytes_deserialize_hex<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: AsRef<[u8]> + FromHex,
+    <T as FromHex>::Error: std::fmt::Display,
+{
+    let hex_str = String::deserialize(deserializer)?;
+    T::from_hex(&hex_str).map_err(serde::de::Error::custom)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use crate::directory::Directory;
+    use crate::ecvrf::HardCodedAkdVRF;
     use crate::errors::AkdError;
-    use crate::primitives::akd_vrf::HardCodedAkdVRF;
     use crate::proof_structs::{AppendOnlyProof, HistoryProof, LookupProof};
     use crate::storage::memory::AsyncInMemoryDatabase;
     use crate::storage::types::{AkdLabel, AkdValue};
@@ -90,21 +117,21 @@ mod tests {
         let akd = Directory::<_, _>::new::<Blake3_256<BaseElement>>(&db, &vrf, false)
             .await
             .unwrap();
-        akd.publish::<Blake3_256<BaseElement>>(
-            vec![
-                (AkdLabel("hello".to_string()), AkdValue("world".to_string())),
-                (
-                    AkdLabel("hello2".to_string()),
-                    AkdValue("world2".to_string()),
-                ),
-            ],
-            false,
-        )
+        akd.publish::<Blake3_256<BaseElement>>(vec![
+            (
+                AkdLabel::from_utf8_str("hello"),
+                AkdValue::from_utf8_str("world"),
+            ),
+            (
+                AkdLabel::from_utf8_str("hello2"),
+                AkdValue::from_utf8_str("world2"),
+            ),
+        ])
         .await
         .unwrap();
         // Generate latest proof
         let lookup_proof = akd
-            .lookup::<Blake3_256<BaseElement>>(AkdLabel("hello".to_string()))
+            .lookup::<Blake3_256<BaseElement>>(AkdLabel::from_utf8_str("hello"))
             .await
             .unwrap();
 
@@ -123,21 +150,21 @@ mod tests {
         let akd = Directory::<_, _>::new::<Blake3_256<BaseElement>>(&db, &vrf, false)
             .await
             .unwrap();
-        akd.publish::<Blake3_256<BaseElement>>(
-            vec![
-                (AkdLabel("hello".to_string()), AkdValue("world".to_string())),
-                (
-                    AkdLabel("hello2".to_string()),
-                    AkdValue("world2".to_string()),
-                ),
-            ],
-            false,
-        )
+        akd.publish::<Blake3_256<BaseElement>>(vec![
+            (
+                AkdLabel::from_utf8_str("hello"),
+                AkdValue::from_utf8_str("world"),
+            ),
+            (
+                AkdLabel::from_utf8_str("hello2"),
+                AkdValue::from_utf8_str("world2"),
+            ),
+        ])
         .await
         .unwrap();
         // Generate latest proof
         let history_proof = akd
-            .key_history::<Blake3_256<BaseElement>>(&AkdLabel("hello".to_string()))
+            .key_history::<Blake3_256<BaseElement>>(&AkdLabel::from_utf8_str("hello"))
             .await
             .unwrap();
 
@@ -157,32 +184,29 @@ mod tests {
             .await
             .unwrap();
         // Commit to the first epoch
-        akd.publish::<Blake3_256<BaseElement>>(
-            vec![
-                (AkdLabel("hello".to_string()), AkdValue("world".to_string())),
-                (
-                    AkdLabel("hello2".to_string()),
-                    AkdValue("world2".to_string()),
-                ),
-            ],
-            false,
-        )
+        akd.publish::<Blake3_256<BaseElement>>(vec![
+            (
+                AkdLabel::from_utf8_str("hello"),
+                AkdValue::from_utf8_str("world"),
+            ),
+            (
+                AkdLabel::from_utf8_str("hello2"),
+                AkdValue::from_utf8_str("world2"),
+            ),
+        ])
         .await
         .unwrap();
         // Commit to the second epoch
-        akd.publish::<Blake3_256<BaseElement>>(
-            vec![
-                (
-                    AkdLabel("hello3".to_string()),
-                    AkdValue("world3".to_string()),
-                ),
-                (
-                    AkdLabel("hello4".to_string()),
-                    AkdValue("world4".to_string()),
-                ),
-            ],
-            false,
-        )
+        akd.publish::<Blake3_256<BaseElement>>(vec![
+            (
+                AkdLabel::from_utf8_str("hello3"),
+                AkdValue::from_utf8_str("world3"),
+            ),
+            (
+                AkdLabel::from_utf8_str("hello4"),
+                AkdValue::from_utf8_str("world4"),
+            ),
+        ])
         .await
         .unwrap();
         // Generate audit proof for the evolution from epoch 1 to epoch 2.

@@ -7,19 +7,25 @@
 
 //! Utility functions
 
+#[cfg(feature = "nostd")]
+use alloc::vec::Vec;
+
 /// Retrieve the marker version
-#[cfg(feature = "vrf")]
 pub(crate) fn get_marker_version(version: u64) -> u64 {
     64u64 - (version.leading_zeros() as u64) - 1u64
 }
 
-// Note that this is the truncating version, since the only thing being
-// verified where this is called is the final hash.
-// If the hash function's output is too large, truncating it should be ok.
-// tl;dr TRUNCATES!
-#[cfg(feature = "vrf")]
-pub(crate) fn vec_to_u8_arr(vector_u8: Vec<u8>) -> [u8; 32] {
-    let mut out_arr = [0u8; 32];
-    out_arr[..vector_u8.len()].clone_from_slice(&vector_u8[..32]);
-    out_arr
+// Corresponds to the I2OSP() function from RFC8017, prepending the length of
+// a byte array to the byte array (so that it is ready for serialization and hashing)
+//
+// Input byte array cannot be > 2^64-1 in length
+pub(crate) fn i2osp_array(input: &[u8]) -> Vec<u8> {
+    [&(input.len() as u64).to_be_bytes(), input].concat()
+}
+
+pub(crate) fn generate_commitment_from_proof_client(
+    value: &crate::AkdValue,
+    proof: &[u8],
+) -> crate::Digest {
+    crate::hash::hash(&[i2osp_array(value), i2osp_array(proof)].concat())
 }

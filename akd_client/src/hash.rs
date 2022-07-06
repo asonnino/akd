@@ -10,7 +10,6 @@
 
 use core::slice;
 
-use crate::EMPTY_VALUE;
 #[cfg(feature = "nostd")]
 use alloc::format;
 #[cfg(feature = "nostd")]
@@ -18,7 +17,7 @@ use alloc::vec::Vec;
 
 use crate::types::Digest as PublicDigest;
 use crate::types::{Direction, NodeLabel};
-use crate::{verify_error, VerificationError, ARITY};
+use crate::{verify_error, VerificationError};
 
 // ======================================
 // SHA2 Settings
@@ -80,14 +79,14 @@ pub(crate) fn merge(items: &[[u8; DIGEST_BYTES]]) -> PublicDigest {
     hash(data)
 }
 
-/// Take a hash and merge a integer hash into it
+/// Take a hash and merge it with an integer and hash the resulting bytes
 #[cfg(feature = "vrf")]
 pub(crate) fn merge_with_int(digest: PublicDigest, value: u64) -> PublicDigest {
-    let mut data = [0; 40];
-    data[..32].copy_from_slice(&digest);
-    // this comes from winter_crypto::Hasher. I'm not a fan of using LE bytes, but it's what's there presently so this is for compat
-    // since AKD utilizes the winter_crypto implementation
-    data[32..].copy_from_slice(&value.to_le_bytes());
+    let mut data = [0; DIGEST_BYTES + 8];
+    data[..DIGEST_BYTES].copy_from_slice(&digest);
+    // this comes from winter_crypto::Hasher. We stick with little-endian bytes everywhere
+    // to avoid system-specific implementation headaches
+    data[DIGEST_BYTES..].copy_from_slice(&value.to_le_bytes());
     hash(&data)
 }
 
@@ -108,10 +107,6 @@ pub(crate) fn build_and_hash_layer(
 
 /// Helper for build_and_hash_layer
 pub(crate) fn hash_layer(hashes: Vec<PublicDigest>, parent_label: NodeLabel) -> PublicDigest {
-    let mut new_hash = hash(&EMPTY_VALUE); //hash_label::<H>(parent_label);
-    for child_hash in hashes.iter().take(ARITY) {
-        new_hash = merge(&[new_hash, *child_hash]);
-    }
-    new_hash = merge(&[new_hash, parent_label.hash()]);
-    new_hash
+    let new_hash = merge(&[hashes[0], hashes[1]]);
+    merge(&[new_hash, parent_label.hash()])
 }
