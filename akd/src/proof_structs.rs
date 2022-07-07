@@ -113,7 +113,7 @@ impl<H: Hasher> Clone for NonMembershipProof<H> {
 /// and the vec of inserted is the set of leaves inserted between these epochs.
 /// If we built the tree using the nodes in inserted and the nodes in unchanged_nodes
 /// as the leaves, it should result in the final root hash.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 #[cfg_attr(
     feature = "serde_serialization",
     derive(serde::Deserialize, serde::Serialize)
