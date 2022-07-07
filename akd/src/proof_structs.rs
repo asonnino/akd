@@ -113,7 +113,7 @@ impl<H: Hasher> Clone for NonMembershipProof<H> {
 /// and the vec of inserted is the set of leaves inserted between these epochs.
 /// If we built the tree using the nodes in inserted and the nodes in unchanged_nodes
 /// as the leaves, it should result in the final root hash.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq)]
 #[cfg_attr(
     feature = "serde_serialization",
     derive(serde::Deserialize, serde::Serialize)
@@ -124,6 +124,15 @@ pub struct AppendOnlyProof<H: Hasher> {
     pub proofs: Vec<SingleAppendOnlyProof<H>>,
     /// Epochs over which this audit is being performed
     pub epochs: Vec<u64>,
+}
+
+impl<H:Hasher> Clone for AppendOnlyProof<H> {
+    fn clone(&self) -> Self {
+        Self {
+            proofs: self.proofs.clone(),
+            epochs: self.epochs.clone()
+        }
+    }
 }
 
 // FIXME: need to fix the documentation
